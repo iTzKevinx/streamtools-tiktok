@@ -1,4 +1,4 @@
 fastapi==0.111.0
 uvicorn==0.29.0
 websockets==12.0
-TikTokLive==6.2.5
+TikTokLive==6.6.5
