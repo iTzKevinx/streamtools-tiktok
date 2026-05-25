@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent
@@ -11,15 +12,43 @@ app = FastAPI()
 def root():
     return {"status": "StreamTools TikTok Server activo"}
 
+async def resolver_usuario(input_str: str) -> str:
+    input_str = input_str.strip()
+    # Si ya es un usuario directo
+    if not input_str.startswith("http"):
+        return input_str.lstrip("@").strip()
+    # Si contiene @usuario en la URL
+    if "tiktok.com/@" in input_str:
+        try:
+            parte = input_str.split("tiktok.com/@")[1]
+            return parte.split("/")[0].split("?")[0].strip()
+        except:
+            return ""
+    # Enlace corto — resolver redirección
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+            resp = await client.get(input_str, headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"
+            })
+            final_url = str(resp.url)
+            if "tiktok.com/@" in final_url:
+                parte = final_url.split("tiktok.com/@")[1]
+                return parte.split("/")[0].split("?")[0].strip()
+    except Exception as e:
+        pass
+    return ""
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    params = websocket.query_params
-    usuario   = params.get("username", "").strip().lstrip("@")
-    palabra   = params.get("keyword", "").strip().lower()
+    params  = websocket.query_params
+    entrada = params.get("username", "").strip()
+    palabra = params.get("keyword", "").strip().lower()
+
+    usuario = await resolver_usuario(entrada)
 
     if not usuario:
-        await websocket.send_text(json.dumps({"error": "Usuario requerido"}))
+        await websocket.send_text(json.dumps({"error": "No se pudo obtener el usuario. Usa @usuario directamente."}))
         await websocket.close()
         return
 
@@ -28,8 +57,8 @@ async def websocket_endpoint(websocket: WebSocket):
     @client.on(ConnectEvent)
     async def on_connect(event):
         try:
-            await websocket.send_text(json.dumps({"type": "connected"}))
-        except Exception:
+            await websocket.send_text(json.dumps({"type": "connected", "usuario": usuario}))
+        except:
             pass
 
     @client.on(CommentEvent)
@@ -42,19 +71,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     "uniqueId": event.user.unique_id,
                     "comment": event.comment
                 }))
-        except Exception:
+        except:
             pass
 
     @client.on(DisconnectEvent)
     async def on_disconnect(event):
         try:
             await websocket.send_text(json.dumps({"type": "disconnected"}))
-        except Exception:
+        except:
             pass
 
     try:
         await client.start()
-        # Mantener la conexión activa
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
@@ -67,14 +95,14 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         try:
             await websocket.send_text(json.dumps({"error": str(e)}))
-        except Exception:
+        except:
             pass
     finally:
         try:
             await client.stop()
-        except Exception:
+        except:
             pass
         try:
             await websocket.close()
-        except Exception:
+        except:
             pass
