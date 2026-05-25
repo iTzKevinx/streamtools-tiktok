@@ -12,6 +12,10 @@ app = FastAPI()
 def root():
     return {"status": "StreamTools TikTok Server activo"}
 
+@app.head("/")
+def root_head():
+    return {}
+
 async def resolver_usuario(input_str: str) -> str:
     input_str = input_str.strip()
     # Si ya es un usuario directo
