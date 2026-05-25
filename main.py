@@ -65,7 +65,9 @@ async def websocket_endpoint(websocket: WebSocket):
     async def on_comment(event):
         try:
             mensaje = event.comment.lower() if event.comment else ""
-            if not palabra or palabra in mensaje:
+            import re
+            palabras = mensaje.split()
+            if not palabra or palabra in palabras:
                 await websocket.send_text(json.dumps({
                     "type": "chat",
                     "uniqueId": event.user.unique_id,
