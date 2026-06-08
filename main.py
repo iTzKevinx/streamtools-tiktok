@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from TikTokLive import TikTokLiveClient
@@ -123,6 +124,20 @@ async def websocket_endpoint(websocket: WebSocket):
     client = TikTokLiveClient(unique_id=usuario)
     stop_event = asyncio.Event()
 
+    # --- Anti-duplicados: guarda IDs de mensajes recientes (últimos 60 seg) ---
+    mensajes_vistos = {}  # msg_id -> timestamp
+
+    def ya_procesado(msg_id: str) -> bool:
+        ahora = time.time()
+        # Limpiar IDs viejos (más de 60 segundos)
+        viejos = [k for k, t in mensajes_vistos.items() if ahora - t > 60]
+        for k in viejos:
+            del mensajes_vistos[k]
+        if msg_id in mensajes_vistos:
+            return True
+        mensajes_vistos[msg_id] = ahora
+        return False
+
     @client.on(ConnectEvent)
     async def on_connect(event):
         try:
@@ -135,11 +150,18 @@ async def websocket_endpoint(websocket: WebSocket):
         try:
             comentario = event.comment or ""
             mensaje = comentario.lower()
+
+            # Filtro anti-duplicados usando ID único del mensaje
+            msg_id = f"chat_{event.user.unique_id}_{comentario}"
+            if ya_procesado(msg_id):
+                return
+
             # Si hay keyword, filtrar; si no hay, enviar todos
             if palabra:
                 palabras = mensaje.split()
                 if palabra not in palabras:
                     return
+
             await websocket.send_text(json.dumps({
                 "type": "chat",
                 "uniqueId": event.user.unique_id,
@@ -153,6 +175,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if not modo_alertas:
             return
         try:
+            # Anti-duplicados para follows (mismo usuario en 10 seg)
+            msg_id = f"follow_{event.user.unique_id}_{int(time.time() // 10)}"
+            if ya_procesado(msg_id):
+                return
             await websocket.send_text(json.dumps({
                 "type": "follow",
                 "uniqueId": event.user.unique_id,
@@ -166,17 +192,25 @@ async def websocket_endpoint(websocket: WebSocket):
         if not modo_alertas:
             return
         try:
-            # Solo enviar cuando el regalo está finalizado (no combos intermedios)
             if hasattr(event, 'gift') and event.gift is not None:
                 if hasattr(event.gift, 'gift_type') and event.gift.gift_type == 1:
                     if hasattr(event, 'repeat_end') and not event.repeat_end:
                         return
+
+            gift_name = event.gift.name if hasattr(event, 'gift') and event.gift else "Gift"
+            gift_count = event.repeat_count if hasattr(event, 'repeat_count') else 1
+
+            # Anti-duplicados para gifts
+            msg_id = f"gift_{event.user.unique_id}_{gift_name}_{int(time.time() // 5)}"
+            if ya_procesado(msg_id):
+                return
+
             await websocket.send_text(json.dumps({
                 "type": "gift",
                 "uniqueId": event.user.unique_id,
                 "nickname": event.user.nickname or event.user.unique_id,
-                "giftName": event.gift.name if hasattr(event, 'gift') and event.gift else "Gift",
-                "giftCount": event.repeat_count if hasattr(event, 'repeat_count') else 1
+                "giftName": gift_name,
+                "giftCount": gift_count
             }))
         except:
             pass
@@ -201,15 +235,25 @@ async def websocket_endpoint(websocket: WebSocket):
             stop_event.set()
 
     async def ping_loop():
-        """Mantiene el WebSocket vivo respondiendo pings de la app."""
+        """Mantiene el WebSocket vivo y detecta si TikTok se desconectó silenciosamente."""
+        sin_actividad = 0
         while not stop_event.is_set():
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
                 if data == "ping":
                     await websocket.send_text("pong")
+                    sin_actividad = 0
             except asyncio.TimeoutError:
                 try:
                     await websocket.send_text("pong")
+                    sin_actividad += 1
+                    # Si llevan más de 5 minutos sin actividad del live, avisar
+                    if sin_actividad >= 10:
+                        await websocket.send_text(json.dumps({
+                            "type": "warning",
+                            "message": "Sin actividad del live por 5 minutos"
+                        }))
+                        sin_actividad = 0
                 except:
                     stop_event.set()
                     break
@@ -221,7 +265,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 break
 
     try:
-        # Correr TikTok y ping loop en PARALELO — este era el bug principal
         await asyncio.gather(tiktok_runner(), ping_loop())
     finally:
         try:
