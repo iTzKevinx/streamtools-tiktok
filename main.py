@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from TikTokLive import TikTokLiveClient
@@ -23,28 +24,78 @@ async def userinfo(username: str):
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.get(
                 f"https://www.tiktok.com/@{username}",
-                headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"}
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9"
+                }
             )
             html = resp.text
-            # Extraer stats del JSON embebido en el HTML
-            import re
-            m = re.search(r'"followerCount":(\d+)', html)
-            followers = int(m.group(1)) if m else -1
-            m = re.search(r'"heartCount":(\d+)', html)
-            likes = int(m.group(1)) if m else -1
-            m = re.search(r'"followingCount":(\d+)', html)
-            following = int(m.group(1)) if m else -1
-            m = re.search(r'"nickname":"([^"]+)"', html)
-            nickname = m.group(1) if m else username
+
+            # Extraer el bloque JSON __UNIVERSAL_DATA_FOR_REHYDRATION__ que es más confiable
+            followers = -1
+            likes = -1
+            following = -1
+            nickname = username
+            avatar_url = ""
+            is_live = False
+
+            # Intentar extraer del JSON embebido (más preciso)
+            m = re.search(r'"followerCount"\s*:\s*(\d+)', html)
+            if m:
+                # Verificar que no sea parte de otro campo (ej: "followerCountText")
+                pos = m.start()
+                before = html[max(0, pos-1):pos]
+                if before not in ['"', '_']:
+                    followers = int(m.group(1))
+
+            # Buscar todas las ocurrencias y tomar la que está dentro del bloque de stats
+            matches = re.findall(r'"followerCount"\s*:\s*(\d+)', html)
+            if matches:
+                # TikTok repite el valor 2 veces — tomar el primero válido
+                followers = int(matches[0])
+
+            matches = re.findall(r'"heartCount"\s*:\s*(\d+)', html)
+            if matches:
+                likes = int(matches[0])
+
+            matches = re.findall(r'"followingCount"\s*:\s*(\d+)', html)
+            if matches:
+                following = int(matches[0])
+
+            m = re.search(r'"nickname"\s*:\s*"([^"]+)"', html)
+            if m:
+                nickname = m.group(1)
+
+            # Avatar: buscar avatarLarger o avatarMedium
+            m = re.search(r'"avatarLarger"\s*:\s*"([^"]+)"', html)
+            if not m:
+                m = re.search(r'"avatarMedium"\s*:\s*"([^"]+)"', html)
+            if m:
+                avatar_url = m.group(1).replace("\\u002F", "/").replace("\\/", "/")
+
+            # Live: buscar roomId o isLiving
+            is_live = bool(re.search(r'"isLiving"\s*:\s*true', html)) or \
+                      bool(re.search(r'"roomId"\s*:\s*"(\d{10,})"', html))
+
             return {
                 "username": username,
                 "nickname": nickname,
                 "followerCount": followers,
                 "heartCount": likes,
-                "followingCount": following
+                "followingCount": following,
+                "avatarUrl": avatar_url,
+                "isLive": is_live
             }
     except Exception as e:
-        return {"username": username, "followerCount": -1, "heartCount": -1, "followingCount": -1, "error": str(e)}
+        return {
+            "username": username,
+            "followerCount": -1,
+            "heartCount": -1,
+            "followingCount": -1,
+            "avatarUrl": "",
+            "isLive": False,
+            "error": str(e)
+        }
 
 async def resolver_usuario(input_str: str) -> str:
     input_str = input_str.strip()
@@ -65,21 +116,19 @@ async def resolver_usuario(input_str: str) -> str:
             if "tiktok.com/@" in final_url:
                 parte = final_url.split("tiktok.com/@")[1]
                 return parte.split("/")[0].split("?")[0].strip()
-    except Exception as e:
+    except:
         pass
     return ""
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    params  = websocket.query_params
-    entrada = params.get("username", "").strip()
-    palabra = params.get("keyword", "").strip().lower()
-    # Modo alertas: si se envía alerts=true, enviar eventos follow y gift
+    params       = websocket.query_params
+    entrada      = params.get("username", "").strip()
+    palabra      = params.get("keyword", "").strip().lower()
     modo_alertas = params.get("alerts", "false").strip().lower() == "true"
 
     usuario = await resolver_usuario(entrada)
-
     if not usuario:
         await websocket.send_text(json.dumps({"error": "No se pudo obtener el usuario. Usa @usuario directamente."}))
         await websocket.close()
@@ -98,7 +147,6 @@ async def websocket_endpoint(websocket: WebSocket):
     async def on_comment(event):
         try:
             mensaje = event.comment.lower() if event.comment else ""
-            import re
             palabras = mensaje.split()
             if not palabra or palabra in palabras:
                 await websocket.send_text(json.dumps({
@@ -127,7 +175,6 @@ async def websocket_endpoint(websocket: WebSocket):
         if not modo_alertas:
             return
         try:
-            # Solo enviar cuando el regalo está completo (evitar eventos parciales)
             if hasattr(event, 'gift') and event.gift is not None:
                 if hasattr(event.gift, 'gift_type') and event.gift.gift_type == 1:
                     if hasattr(event, 'repeat_end') and not event.repeat_end:
