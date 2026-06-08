@@ -31,7 +31,6 @@ async def userinfo(username: str):
             )
             html = resp.text
 
-            # Extraer el bloque JSON __UNIVERSAL_DATA_FOR_REHYDRATION__ que es más confiable
             followers = -1
             likes = -1
             following = -1
@@ -39,19 +38,8 @@ async def userinfo(username: str):
             avatar_url = ""
             is_live = False
 
-            # Intentar extraer del JSON embebido (más preciso)
-            m = re.search(r'"followerCount"\s*:\s*(\d+)', html)
-            if m:
-                # Verificar que no sea parte de otro campo (ej: "followerCountText")
-                pos = m.start()
-                before = html[max(0, pos-1):pos]
-                if before not in ['"', '_']:
-                    followers = int(m.group(1))
-
-            # Buscar todas las ocurrencias y tomar la que está dentro del bloque de stats
             matches = re.findall(r'"followerCount"\s*:\s*(\d+)', html)
             if matches:
-                # TikTok repite el valor 2 veces — tomar el primero válido
                 followers = int(matches[0])
 
             matches = re.findall(r'"heartCount"\s*:\s*(\d+)', html)
@@ -66,14 +54,12 @@ async def userinfo(username: str):
             if m:
                 nickname = m.group(1)
 
-            # Avatar: buscar avatarLarger o avatarMedium
             m = re.search(r'"avatarLarger"\s*:\s*"([^"]+)"', html)
             if not m:
                 m = re.search(r'"avatarMedium"\s*:\s*"([^"]+)"', html)
             if m:
                 avatar_url = m.group(1).replace("\\u002F", "/").replace("\\/", "/")
 
-            # Live: buscar roomId o isLiving
             is_live = bool(re.search(r'"isLiving"\s*:\s*true', html)) or \
                       bool(re.search(r'"roomId"\s*:\s*"(\d{10,})"', html))
 
@@ -135,6 +121,7 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     client = TikTokLiveClient(unique_id=usuario)
+    stop_event = asyncio.Event()
 
     @client.on(ConnectEvent)
     async def on_connect(event):
@@ -146,14 +133,18 @@ async def websocket_endpoint(websocket: WebSocket):
     @client.on(CommentEvent)
     async def on_comment(event):
         try:
-            mensaje = event.comment.lower() if event.comment else ""
-            palabras = mensaje.split()
-            if not palabra or palabra in palabras:
-                await websocket.send_text(json.dumps({
-                    "type": "chat",
-                    "uniqueId": event.user.unique_id,
-                    "comment": event.comment
-                }))
+            comentario = event.comment or ""
+            mensaje = comentario.lower()
+            # Si hay keyword, filtrar; si no hay, enviar todos
+            if palabra:
+                palabras = mensaje.split()
+                if palabra not in palabras:
+                    return
+            await websocket.send_text(json.dumps({
+                "type": "chat",
+                "uniqueId": event.user.unique_id,
+                "comment": comentario
+            }))
         except:
             pass
 
@@ -175,6 +166,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if not modo_alertas:
             return
         try:
+            # Solo enviar cuando el regalo está finalizado (no combos intermedios)
             if hasattr(event, 'gift') and event.gift is not None:
                 if hasattr(event.gift, 'gift_type') and event.gift.gift_type == 1:
                     if hasattr(event, 'repeat_end') and not event.repeat_end:
@@ -191,27 +183,46 @@ async def websocket_endpoint(websocket: WebSocket):
 
     @client.on(DisconnectEvent)
     async def on_disconnect(event):
+        stop_event.set()
         try:
             await websocket.send_text(json.dumps({"type": "disconnected"}))
         except:
             pass
 
-    try:
-        await client.start()
-        while True:
+    async def tiktok_runner():
+        try:
+            await client.start()
+        except Exception as e:
+            try:
+                await websocket.send_text(json.dumps({"error": str(e)}))
+            except:
+                pass
+        finally:
+            stop_event.set()
+
+    async def ping_loop():
+        """Mantiene el WebSocket vivo respondiendo pings de la app."""
+        while not stop_event.is_set():
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
                 if data == "ping":
                     await websocket.send_text("pong")
             except asyncio.TimeoutError:
-                await websocket.send_text("pong")
+                try:
+                    await websocket.send_text("pong")
+                except:
+                    stop_event.set()
+                    break
             except WebSocketDisconnect:
+                stop_event.set()
                 break
-    except Exception as e:
-        try:
-            await websocket.send_text(json.dumps({"error": str(e)}))
-        except:
-            pass
+            except Exception:
+                stop_event.set()
+                break
+
+    try:
+        # Correr TikTok y ping loop en PARALELO — este era el bug principal
+        await asyncio.gather(tiktok_runner(), ping_loop())
     finally:
         try:
             await client.stop()
