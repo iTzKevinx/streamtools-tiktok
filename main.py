@@ -112,6 +112,7 @@ async def websocket_endpoint(websocket: WebSocket):
     entrada      = params.get("username", "").strip()
     palabra      = params.get("keyword", "").strip().lower()
     modo_alertas = params.get("alerts", "false").strip().lower() == "true"
+    sessionid    = params.get("sessionid", "").strip()
 
     # Limpiar keyword inválido (punto solo, espacios, etc.)
     if palabra in [".", ",", " ", ""]:
@@ -125,7 +126,10 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    client = TikTokLiveClient(unique_id=usuario)
+    client = TikTokLiveClient(
+        unique_id=usuario,
+        **({"session_id": sessionid} if sessionid else {})
+    )
     stop_event = asyncio.Event()
     mensajes_vistos = {}
 
