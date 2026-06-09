@@ -251,7 +251,7 @@ async def websocket_endpoint(websocket: WebSocket):
         async def recibir():
             while not stop_event.is_set():
                 try:
-                    data = await asyncio.wait_for(websocket.receive_text(), timeout=90)
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=180)
                     if data == "ping":
                         await websocket.send_text("pong")
                 except asyncio.TimeoutError:
