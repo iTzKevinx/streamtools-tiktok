@@ -105,6 +105,9 @@ async def resolver_usuario(input_str: str) -> str:
         pass
     return ""
 
+# Registro global para evitar múltiples clientes del mismo usuario
+_sesiones_activas: dict = {}
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -121,6 +124,14 @@ async def websocket_endpoint(websocket: WebSocket):
     usuario = await resolver_usuario(entrada)
     logger.info(f"[WS] Conectando usuario='{usuario}' keyword='{palabra}' alerts={modo_alertas}")
 
+    # Cancelar sesión anterior del mismo usuario si existe
+    if usuario in _sesiones_activas:
+        logger.info(f"[WS] Cerrando sesión previa de '{usuario}'")
+        try:
+            _sesiones_activas[usuario].set()
+        except Exception:
+            pass
+
     if not usuario:
         await websocket.send_text(json.dumps({"error": "No se pudo obtener el usuario."}))
         await websocket.close()
@@ -130,6 +141,8 @@ async def websocket_endpoint(websocket: WebSocket):
     if sessionid:
         client.web.cookies.set("sessionid", sessionid, domain=".tiktok.com")
     stop_event = asyncio.Event()
+    if usuario:
+        _sesiones_activas[usuario] = stop_event
     mensajes_vistos = {}
 
     def ya_procesado(msg_id: str) -> bool:
@@ -236,13 +249,16 @@ async def websocket_endpoint(websocket: WebSocket):
     async def ping_loop():
         while not stop_event.is_set():
             try:
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                # Esperar mensaje del cliente hasta 60 segundos
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=60)
                 if data == "ping":
                     await websocket.send_text("pong")
             except asyncio.TimeoutError:
+                # Sin ping en 60s — intentar mandar pong para verificar si sigue vivo
                 try:
                     await websocket.send_text("pong")
-                except:
+                except Exception:
+                    logger.info(f"[WS] Cliente inactivo, cerrando '{usuario}'")
                     stop_event.set()
                     break
             except WebSocketDisconnect:
@@ -250,13 +266,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 stop_event.set()
                 break
             except Exception as e:
-                logger.error(f"[WS] Error en ping_loop: {e}")
+                err = str(e)
+                # Cierre limpio code=1000 — no es un error real
+                if "1000" in err or "ConnectionClosedOK" in err:
+                    logger.info(f"[WS] Cierre limpio de '{usuario}'")
+                else:
+                    logger.error(f"[WS] Error en ping_loop '{usuario}': {e}")
                 stop_event.set()
                 break
 
     try:
         await asyncio.gather(tiktok_runner(), ping_loop())
     finally:
+        # Limpiar del registro global
+        if usuario and _sesiones_activas.get(usuario) is stop_event:
+            del _sesiones_activas[usuario]
         try:
             await client.stop()
         except:
