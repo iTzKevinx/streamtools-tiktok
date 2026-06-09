@@ -126,10 +126,9 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    client = TikTokLiveClient(
-        unique_id=usuario,
-        **({"session_id": sessionid} if sessionid else {})
-    )
+    client = TikTokLiveClient(unique_id=usuario)
+    if sessionid:
+        client.web.cookies.set("sessionid", sessionid, domain=".tiktok.com")
     stop_event = asyncio.Event()
     mensajes_vistos = {}
 
