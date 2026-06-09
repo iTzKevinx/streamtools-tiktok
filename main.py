@@ -247,33 +247,44 @@ async def websocket_endpoint(websocket: WebSocket):
             stop_event.set()
 
     async def ping_loop():
-        while not stop_event.is_set():
-            try:
-                # Esperar mensaje del cliente hasta 60 segundos
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=60)
-                if data == "ping":
-                    await websocket.send_text("pong")
-            except asyncio.TimeoutError:
-                # Sin ping en 60s — intentar mandar pong para verificar si sigue vivo
+        """Dos tareas en paralelo: recibir pings del cliente y mandar pings proactivos."""
+        async def recibir():
+            while not stop_event.is_set():
                 try:
-                    await websocket.send_text("pong")
-                except Exception:
-                    logger.info(f"[WS] Cliente inactivo, cerrando '{usuario}'")
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=90)
+                    if data == "ping":
+                        await websocket.send_text("pong")
+                except asyncio.TimeoutError:
+                    # Sin mensaje en 90s — cliente desaparecido
+                    logger.info(f"[WS] Timeout cliente '{usuario}'")
                     stop_event.set()
                     break
-            except WebSocketDisconnect:
-                logger.info(f"[WS] App desconectó el WebSocket de '{usuario}'")
-                stop_event.set()
-                break
-            except Exception as e:
-                err = str(e)
-                # Cierre limpio code=1000 — no es un error real
-                if "1000" in err or "ConnectionClosedOK" in err:
-                    logger.info(f"[WS] Cierre limpio de '{usuario}'")
-                else:
-                    logger.error(f"[WS] Error en ping_loop '{usuario}': {e}")
-                stop_event.set()
-                break
+                except WebSocketDisconnect:
+                    logger.info(f"[WS] App desconectó el WebSocket de '{usuario}'")
+                    stop_event.set()
+                    break
+                except Exception as e:
+                    err = str(e)
+                    if "1000" in err or "ConnectionClosedOK" in err:
+                        logger.info(f"[WS] Cierre limpio de '{usuario}'")
+                    else:
+                        logger.error(f"[WS] Error recibiendo '{usuario}': {e}")
+                    stop_event.set()
+                    break
+
+        async def enviar_pings():
+            """Manda un ping proactivo cada 20s para mantener la conexión viva."""
+            while not stop_event.is_set():
+                await asyncio.sleep(20)
+                if stop_event.is_set():
+                    break
+                try:
+                    await websocket.send_text("ping")
+                except Exception:
+                    stop_event.set()
+                    break
+
+        await asyncio.gather(recibir(), enviar_pings())
 
     try:
         await asyncio.gather(tiktok_runner(), ping_loop())
